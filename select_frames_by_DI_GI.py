@@ -64,7 +64,11 @@ select_frames_by_DI_GI.py
     # Вместо жёсткого окна — выбрать 10 ближайших кадров к целевой точке:
     python3 select_frames_by_DI_GI.py ... --top_n 10
 
-Зависимости: numpy, MDAnalysis (matplotlib — только для опции --plot).
+    # Перестроить только heatmap по уже рассчитанному CSV — БЕЗ пересчёта траектории:
+    python3 select_frames_by_DI_GI.py --from_csv all_frames.csv \
+        --DI 0.7 --GI 11.0 --out_png fes_hist.png
+
+Зависимости: numpy, MDAnalysis (matplotlib — только для опций --plot / --from_csv).
 """
 
 import argparse
@@ -470,27 +474,61 @@ def plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_png
 
 
 # ---------------------------------------------------------------------------
+# CSV -> heatmap (без пересчёта траектории)
+# ---------------------------------------------------------------------------
+def load_di_gi_from_csv(path):
+    """Читает out_csv (колонки frame,time_ps,DI,GI) и возвращает массивы DI, GI.
+
+    Строчка заголовка пропускается; пустые строки игнорируются.
+    """
+    di_vals, gi_vals = [], []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) < 4:
+                raise ValueError(f"Строка '{line}' в {path}: ожидалось 4 колонки "
+                                 "(frame,time_ps,DI,GI). Возможно, это не CSV из этой программы?")
+            try:
+                di_vals.append(float(parts[2]))
+                gi_vals.append(float(parts[3]))
+            except ValueError:
+                continue  # строка заголовка ("DI"/"GI" не парсятся как float)
+    if not di_vals:
+        raise ValueError(f"В файле {path} нет ни одной строки с числовыми DI/GI.")
+    return np.asarray(di_vals), np.asarray(gi_vals)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Отбор кадров МД-траектории по значениям коллективных переменных DI и GI.",
+        description="Отбор кадров МД-траектории по значениям коллективных переменных DI и GI.\n"
+                    "Режим пересчёта: укажите --gro/--xtc/--ndx_O/--ndx_C.\n"
+                    "Режим heatmap из CSV: укажите --from_csv (тогда --DI/--GI необязательны).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--gro", required=True,
+    p.add_argument("--gro",
                    help="Файл топологии (.gro или .pdb): массы, порядок атомов, бокс.")
-    p.add_argument("--xtc", required=True,
+    p.add_argument("--xtc",
                    help="Траектория (.xtc).")
-    p.add_argument("--ndx_O", required=True,
+    p.add_argument("--ndx_O",
                    help="Index-файл с группами centralO (cal1_centralO ... cal6_centralO).")
-    p.add_argument("--ndx_C", required=True,
+    p.add_argument("--ndx_C",
                    help="Index-файл с группами tailC (cal1_tailC ... cal6_tailC).")
-    p.add_argument("--DI", type=float, required=True, help="Целевое значение Dimer Index.")
-    p.add_argument("--GI", type=float, required=True, help="Целевое значение Growth Index.")
+    p.add_argument("--from_csv", metavar="CSV",
+                   help="Построить только 2D-гистограмму (DI, GI) по уже рассчитанному CSV "
+                        "(колонки frame,time_ps,DI,GI) — без загрузки и пересчёта траектории. "
+                        "В этом режиме результаты отбора НЕ перезаписываются.")
+    p.add_argument("--DI", type=float, help="Целевое значение Dimer Index.")
+    p.add_argument("--GI", type=float, help="Целевое значение Growth Index.")
     p.add_argument("--tol_DI", type=float, default=0.2, help="Допуск по DI.")
     p.add_argument("--tol_GI", type=float, default=0.3, help="Допуск по GI.")
-    p.add_argument("--out_xtc", required=True, help="Выходная траектория с отобранными кадрами.")
-    p.add_argument("--out_csv", required=True, help="CSV со значениями DI/GI для всех кадров.")
+    p.add_argument("--out_xtc", help="Выходная траектория с отобранными кадрами.")
+    p.add_argument("--out_csv", help="CSV со значениями DI/GI для всех кадров.")
     p.add_argument("--plot", action="store_true",
                    help="Построить 2D-гистограмму (DI, GI) и сохранить в --out_png.")
     p.add_argument("--out_png", default="DI_GI_hist.png",
@@ -508,6 +546,38 @@ def parse_args():
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
+
+    # --- Режим 2: heatmap по уже рассчитанному CSV (без пересчёта) ----------
+    if args.from_csv:
+        if not os.path.isfile(args.from_csv):
+            sys.exit(f"ОШИБКА: CSV-файл не найден: {args.from_csv}")
+        try:
+            di_all, gi_all = load_di_gi_from_csv(args.from_csv)
+        except ValueError as e:
+            sys.exit(f"ОШИБКА: {e}")
+        print(f"Загружено кадров из CSV: {len(di_all)} ({args.from_csv})")
+        print(f"DI: min={di_all.min():.3f}, max={di_all.max():.3f}; "
+              f"GI: min={gi_all.min():.3f}, max={gi_all.max():.3f}")
+        DI_target = args.DI if args.DI is not None else float(np.median(di_all))
+        GI_target = args.GI if args.GI is not None else float(np.median(gi_all))
+        if args.DI is None or args.GI is None:
+            print("ПРЕДУПРЕЖДЕНИЕ: --DI/--GI не заданы — целевая точка на графике "
+                  "поставлена в медиану распределения.")
+        plot_histogram(di_all, gi_all, DI_target, GI_target,
+                       args.tol_DI, args.tol_GI, args.out_png)
+        return
+
+    # --- Режим 1: полный пересчёт по траектории ------------------------------
+    missing = [name for name, val in (("--gro", args.gro), ("--xtc", args.xtc),
+                                      ("--ndx_O", args.ndx_O), ("--ndx_C", args.ndx_C),
+                                      ("--out_xtc", args.out_xtc), ("--out_csv", args.out_csv))
+               if not val]
+    if missing:
+        sys.exit("ОШИБКА: для расчёта по траектории обязательны аргументы: "
+                 + ", ".join(missing) + "\n(если нужно только перестроить график по CSV — "
+                 "используйте --from_csv)")
+    if args.DI is None or args.GI is None:
+        sys.exit("ОШИБКА: задайте целевые значения --DI и --GI.")
 
     # --- 1. Загрузка топологии и траектории через MDAnalysis ---------------
     for f in (args.gro, args.xtc, args.ndx_O, args.ndx_C):
