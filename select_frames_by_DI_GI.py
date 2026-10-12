@@ -45,8 +45,25 @@ select_frames_by_DI_GI.py
 Выход скрипта:
   * CSV-файл со всеми кадрами: frame, time_ps, DI, GI;
   * XTC-файл с отобранными кадрами (в исходном порядке, все атомы системы);
+  * Timeline — полоса времени всей траектории (серая), на которой ярким
+    цветом выделены интервалы кадров, попавших в selected (см. ниже);
   * (опционально) 2D-гистограмма (DI, GI) с целевой точкой и окном допуска;
   * краткий отчёт в stdout.
+
+TIMELINE (полоса времени):
+  * Серая горизонтальная полоса = всё время исходной траектории
+    (от первого до последнего кадра).
+  * Яркие цветные полосы поверх неё = промежутки времени, в которые система
+    находилась в нужной области значений DI/GI (кадры из selected соседние
+    кадры склеиваются в непрерывные интервалы).
+  * Строится всегда при полном расчёте (--out_timeline_html / --out_timeline_png;
+    по умолчанию — рядом с --out_csv). Если plotly не установлен,
+    интерактивный HTML пропускается с предупреждением; статический PNG
+    строится matplotlib'ом.
+  * Интерактивная версия (HTML, plotly): при наведении курсора на яркий
+    интервал во всплывающей подсказке показывается его начало/конец
+    (время и номера кадров), длительность и число отобранных кадров;
+    при наведении на серую полосу — общая длительность траектории.
 
 Пример запуска:
 
@@ -474,6 +491,222 @@ def plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_png
 
 
 # ---------------------------------------------------------------------------
+# Timeline: полоса времени всей траектории с выделенными отобранными интервалами
+# ---------------------------------------------------------------------------
+def merge_selected_intervals(sel_pos, frames, times, dt_frames=None):
+    """Склеивает отобранные кадры в непрерывные временные интервалы.
+
+    Два соседних отобранных кадра считаются частью одного интервала, если они
+    идут подряд в траектории (разница номеров кадров == stride, по умолчанию 1).
+    Границы интервала — середины «зазоров» до/после первого и последнего кадра
+    интервала (т.е. интервал покрывает время, в течение которого система
+    находилась в целевой области DI/GI).
+
+    Параметры:
+        sel_pos   : позиции отобранных кадров в массивах frames/times (возр. порядок)
+        frames    : номера всех кадров траектории
+        times     : времена всех кадров (пс)
+        dt_frames : максимальный шаг между «соседними» кадрами (по умолчанию 1)
+    Возвращает список словарей:
+        {t_start, t_end, f_start, f_end, n_frames}
+    """
+    if len(sel_pos) == 0:
+        return []
+    stride = int(dt_frames) if dt_frames else 1
+    intervals = []
+    run = [int(sel_pos[0])]
+    for pos in list(sel_pos[1:]) + [None]:
+        if pos is not None and (int(frames[pos]) - int(frames[run[-1]])) <= stride:
+            run.append(int(pos))
+            continue
+        # закрываем накопленный интервал
+        first, last = run[0], run[-1]
+        # границы: середина зазора с предыдущим/следующим кадром траектории
+        if first - 1 >= 0:
+            t_start = 0.5 * (float(times[first - 1]) + float(times[first]))
+            f_start = int(frames[first - 1])
+        else:
+            t_start = float(times[first])
+            f_start = int(frames[first])
+        if last + 1 < len(frames):
+            t_end = 0.5 * (float(times[last]) + float(times[last + 1]))
+            f_end = int(frames[last + 1])
+        else:
+            t_end = float(times[last])
+            f_end = int(frames[last])
+        intervals.append({
+            "t_start": t_start, "t_end": t_end,
+            "f_start": f_start, "f_end": f_end,
+            "n_frames": len(run),
+        })
+        if pos is not None:
+            run = [int(pos)]
+    return intervals
+
+
+def plot_timeline_static(frames, times, intervals, out_png, title=None):
+    """Статическая (PNG) версия timeline средствами matplotlib.
+
+    Серая полоса = всё время траектории; поверх — яркие прямоугольники
+    интервалов, когда система была в целевой области DI/GI.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except ImportError:
+        print("ПРЕДУПРЕЖДЕНИЕ: matplotlib не установлен, пропускаю PNG-timeline.")
+        return False
+
+    t0, t1 = float(times.min()), float(times.max())
+    fig, ax = plt.subplots(figsize=(12, 2.6))
+
+    # серая полоса — вся траектория
+    ax.add_patch(Rectangle((t0, 0.35), t1 - t0, 0.30, facecolor="#b0b0b0",
+                           edgecolor="#808080", lw=0.5, zorder=1))
+    # яркие интервалы selected
+    colors = ["#e4572e", "#f3a712", "#00a5cf", "#7ae582", "#ff4d6d"]
+    for k, iv in enumerate(intervals):
+        w = max(iv["t_end"] - iv["t_start"], (t1 - t0) / max(len(frames), 1) * 0.9)
+        ax.add_patch(Rectangle((iv["t_start"], 0.30), w, 0.40,
+                               facecolor=colors[k % len(colors)],
+                               edgecolor="black", lw=0.4, zorder=2))
+        ax.text(iv["t_start"] + w / 2.0, 0.78, f"#{k+1}", ha="center",
+                va="bottom", fontsize=7, color=colors[k % len(colors)], zorder=3)
+
+    ax.set_xlim(t0 - 0.02 * (t1 - t0 + 1e-9), t1 + 0.02 * (t1 - t0 + 1e-9))
+    ax.set_ylim(0.15, 1.0)
+    ax.get_yaxis().set_visible(False)
+    for spine in ("left", "right", "top"):
+        ax.spines[spine].set_visible(False)
+    ax.set_xlabel("Время, пс")
+    ax.set_title(title or
+                 (f"Полоса времени траектории ({t0:.0f}–{t1:.0f} пс); "
+                  f"ярким — интервалы попадания в цель (всего {len(intervals)})"),
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"Timeline (статический PNG) сохранён: {out_png}")
+    return True
+
+
+def plot_timeline_interactive(frames, times, di_all, gi_all, intervals, out_html,
+                              target=None, tol=None, title=None):
+    """Интерактивная timeline (HTML, plotly): серая полоса всей траектории,
+    яркие интервалы selected реагируют на наведение курсора всплывающей
+    подсказкой (время, номера кадров, длительность, число кадров, средние
+    DI/GI внутри интервала). Дополнительно — графики DI(t)/GI(t) с окном допуска.
+
+    Возвращает True, если файл создан; False — если plotly недоступен.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("ПРЕДУПРЕЖДЕНИЕ: plotly не установлен (pip install plotly), "
+              "пропускаю интерактивный HTML-timeline; будет только PNG.")
+        return False
+
+    t0, t1 = float(times.min()), float(times.max())
+    span = t1 - t0 if t1 > t0 else 1.0
+
+    fig = make_subplots_safe(go)
+
+    # --- ряд 1: серая полоса всей траектории -------------------------------
+    fig.add_trace(
+        go.Scatter(x=[t0, t1], y=[1, 1], mode="lines",
+                   line=dict(color="rgb(176,176,176)", width=22),
+                   name="Вся траектория",
+                   hovertemplate=(f"<b>Вся траектория</b><br>"
+                                  f"{t0:.1f} – {t1:.1f} пс<br>"
+                                  f"длительность: {span:.1f} пс<br>"
+                                  f"кадров: {len(frames)}<extra></extra>")),
+        row=1, col=1)
+
+    # --- ряд 1: яркие интервалы selected ------------------------------------
+    colors = ["#e4572e", "#f3a712", "#00a5cf", "#7ae582", "#ff4d6d", "#b892ff"]
+    for k, iv in enumerate(intervals):
+        idx = np.nonzero((frames >= iv["f_start"]) & (frames <= iv["f_end"]))[0]
+        # реальные (попадные) границы по времени выбранных кадров
+        ts_sel = times[idx]
+        di_sel = di_all[idx] if len(idx) else np.array([np.nan])
+        gi_sel = gi_all[idx] if len(idx) else np.array([np.nan])
+        dur = iv["t_end"] - iv["t_start"]
+        fig.add_trace(
+            go.Scatter(x=[iv["t_start"], iv["t_end"]], y=[1, 1], mode="lines",
+                       line=dict(color=colors[k % len(colors)], width=22),
+                       name=f"Интервал #{k+1}",
+                       showlegend=False,
+                       hovertemplate=(
+                           f"<b>Интервал #{k+1} (selected)</b><br>"
+                           f"Время: {iv['t_start']:.1f} – {iv['t_end']:.1f} пс "
+                           f"(Δ={dur:.1f} пс)<br>"
+                           f"Кадры: {iv['f_start']} – {iv['f_end']} "
+                           f"({len(ts_sel)} попавших)<br>"
+                           f"DI: {di_sel.min():.3f} … {di_sel.max():.3f} "
+                           f"(средн. {np.nanmean(di_sel):.3f})<br>"
+                           f"GI: {gi_sel.min():.3f} … {gi_sel.max():.3f} "
+                           f"(средн. {np.nanmean(gi_sel):.3f})"
+                           "<extra></extra>")),
+            row=1, col=1)
+
+    # --- ряд 2: DI(t), ряд 3: GI(t) — контекст ------------------------------
+    fig.add_trace(go.Scatter(x=times, y=di_all, mode="lines", name="DI(t)",
+                             line=dict(color="#3366cc", width=1),
+                             hovertemplate="t=%{x:.1f} пс<br>DI=%{y:.4f}<extra></extra>"),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=times, y=gi_all, mode="lines", name="GI(t)",
+                             line=dict(color="#cc3311", width=1),
+                             hovertemplate="t=%{x:.1f} пс<br>GI=%{y:.4f}<extra></extra>"),
+                  row=3, col=1)
+
+    # окно допуска / целевая точка на рядах DI/GI
+    if target is not None:
+        DI_t, GI_t = target
+        hDI = dict(row=2, col=1); hGI = dict(row=3, col=1)
+        if tol is not None:
+            tDI, tGI = tol
+            fig.add_hrect(y0=DI_t - tDI, y1=DI_t + tDI, line=dict(color="red", width=1, dash="dot"),
+                          fillcolor="rgba(255,0,0,0.08)", **hDI)
+            fig.add_hrect(y0=GI_t - tGI, y1=GI_t + tGI, line=dict(color="red", width=1, dash="dot"),
+                          fillcolor="rgba(255,0,0,0.08)", **hGI)
+        fig.add_hline(y=DI_t, line=dict(color="red", width=1), **hDI)
+        fig.add_hline(y=GI_t, line=dict(color="red", width=1), **hGI)
+
+    # подсветка интервалов на рядах DI/GI вертикальными shapes
+    for k, iv in enumerate(intervals):
+        for r in (2, 3):
+            fig.add_vrect(x0=iv["t_start"], x1=iv["t_end"], row=r, col=1,
+                          fillcolor=colors[k % len(colors)], opacity=0.12,
+                          line_width=0)
+
+    fig.update_xaxes(range=[t0 - 0.02 * span, t1 + 0.02 * span], row=1, col=1)
+    fig.update_yaxes(visible=False, range=[0.6, 1.4], row=1, col=1)
+    fig.update_xaxes(title_text="Время, пс", row=3, col=1)
+    fig.update_yaxes(title_text="DI", row=2, col=1)
+    fig.update_yaxes(title_text="GI", row=3, col=1)
+    fig.update_layout(
+        height=620,
+        template="plotly_white",
+        title=title or ("Полоса времени траектории: серым — всё время, "
+                        "ярким — кадры, попавшие в selected (наведите курсор)"),
+        margin=dict(l=60, r=20, t=60, b=40),
+        hovermode="closest",
+    )
+    fig.write_html(out_html, include_plotlyjs="cdn")
+    print(f"Timeline (интерактивный HTML) сохранён: {out_html}")
+    return True
+
+
+def make_subplots_safe(go):
+    """Фигура из 3 строк (timeline / DI(t) / GI(t)) с общими осями X."""
+    from plotly.subplots import make_subplots
+    return make_subplots(rows=3, cols=1, shared_xaxes=True,
+                         row_heights=[0.18, 0.41, 0.41], vertical_spacing=0.08)
+
+
+# ---------------------------------------------------------------------------
 # CSV -> heatmap (без пересчёта траектории)
 # ---------------------------------------------------------------------------
 def load_di_gi_from_csv(path):
@@ -533,6 +766,18 @@ def parse_args():
                    help="Построить 2D-гистограмму (DI, GI) и сохранить в --out_png.")
     p.add_argument("--out_png", default="DI_GI_hist.png",
                    help="Имя файла графика при использовании --plot.")
+    p.add_argument("--out_timeline_html", metavar="HTML", default=None,
+                   help="Интерактивная полоса времени (plotly HTML): серая полоса — "
+                        "всё время траектории, яркие интервалы — кадры из selected; "
+                        "при наведении курсора показывается информация об интервале. "
+                        "По умолчанию: <out_csv без расширения>_timeline.html. "
+                        "Пустая строка \"\" — не создавать.")
+    p.add_argument("--out_timeline_png", metavar="PNG", default=None,
+                   help="Статическая (PNG) версия полосы времени (matplotlib). "
+                        "По умолчанию: <out_csv без расширения>_timeline.png. "
+                        "Пустая строка \"\" — не создавать.")
+    p.add_argument("--no_timeline", action="store_true",
+                   help="Не строить полосу времени вообще (ни HTML, ни PNG).")
     p.add_argument("--top_n", type=int, default=None,
                    help="Вместо окна допуска выбрать N кадров, ближайших к (DI, GI) "
                         "по евклидову расстоянию.")
@@ -708,6 +953,27 @@ def main():
     # --- опциональный график ------------------------------------------------
     if args.plot:
         plot_histogram(di_all, gi_all, args.DI, args.GI, args.tol_DI, args.tol_GI, args.out_png)
+
+    # --- полоса времени (timeline): серая — вся траектория, яркие — selected --
+    if not args.no_timeline:
+        intervals = merge_selected_intervals(sel_pos, frames, times)
+        base_csv, _ = os.path.splitext(args.out_csv)
+        html_out = args.out_timeline_html if args.out_timeline_html is not None \
+            else base_csv + "_timeline.html"
+        png_out = args.out_timeline_png if args.out_timeline_png is not None \
+            else base_csv + "_timeline.png"
+        tl_title = (f"Полоса времени траектории; цель: DI={args.DI:.3f}, GI={args.GI:.3f}; "
+                    f"отобрано кадров: {len(sel_pos)}")
+        if len(intervals) == 0:
+            print("Примечание: ни один кадр не попал в окно допуска — "
+                  "timeline будет построена без ярких интервалов.")
+        if html_out:
+            plot_timeline_interactive(frames, times, di_all, gi_all, intervals, html_out,
+                                      target=(args.DI, args.GI),
+                                      tol=(args.tol_DI, args.tol_GI),
+                                      title=tl_title)
+        if png_out:
+            plot_timeline_static(frames, times, intervals, png_out, title=tl_title)
 
     print("\nГотово.")
 
