@@ -605,6 +605,13 @@ def main():
         print(f"Номера кадров: {preview}")
 
         # --- 7. Сохранение отобранных кадров в XTC --------------------------
+        # ВНИМАНИЕ: XTC содержит только координаты (и бокс), без имён атомов.
+        # ChimeraX/VMD подставляют к ним топологию из .gro/.pdb — если открыть
+        # selected.xtc вместе с solv-топологией (14451 ат.), получится ошибка
+        # "structure has N atoms whereas the coordinates are for 456 atoms".
+        # Поэтому рядом с XTC всегда пишем согласованный ref-frame .gro на ТЕ
+        # же самые атомы и в том же порядке (универсальный способ для любого
+        # набора атомов: берём Universe, созданный программой по --gro).
         w = mda.Writer(args.out_xtc, u.atoms.n_atoms)
         count = 0
         for pos in sel_pos:
@@ -613,6 +620,20 @@ def main():
             count += 1
         w.close()
         print(f"Сохранено {count} кадров -> {args.out_xtc}")
+
+        base, _ = os.path.splitext(args.out_xtc)
+        gro_out = base + ".gro"
+        first_sel_frame = int(frames[sel_pos[0]])
+        u.trajectory[first_sel_frame]
+        try:
+            u.atoms.write(gro_out)
+            print(f"Референсная топология ({u.atoms.n_atoms} ат., кадр {first_sel_frame}) "
+                  f"записана -> {gro_out}")
+            print("Открывайте в ChimeraX ЭТУ пару файлов, например:\n"
+                  f"    open {gro_out}\n"
+                  f"    movie read {args.out_xtc} start {first_sel_frame}")
+        except Exception as e:
+            print(f"ПРЕДУПРЕЖДЕНИЕ: не удалось записать {gro_out}: {e}")
 
     # --- опциональный график ------------------------------------------------
     if args.plot:
