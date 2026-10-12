@@ -48,6 +48,11 @@ select_frames_by_DI_GI.py
   * Timeline — полоса времени всей траектории (серая), на которой ярким
     цветом выделены интервалы кадров, попавших в selected (см. ниже);
   * (опционально) 2D-гистограмма (DI, GI) с целевой точкой и окном допуска;
+    цветовая шкала тепловой карты — ДИСКРЕТНАЯ: много отдельных цветов
+    (до ~48 уровней, каждый цвет = интервал популяции в 1 кадр), взятых из
+    последовательной палитры viridis (тёмно-фиолетовый = редко -> жёлтый =
+    часто), с белыми границами между ячейками — близкие по популяции ячейки
+    легко различаются глазом; число уровней настраивается --heatmap_levels;
   * краткий отчёт в stdout.
 
 TIMELINE (полоса времени):
@@ -89,6 +94,7 @@ TIMELINE (полоса времени):
 """
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -455,20 +461,98 @@ def analyze_trajectory(universe, o_idx, c_idx, progress_every=1000):
 # ---------------------------------------------------------------------------
 # Опциональный график 2D-гистограммы (DI, GI)
 # ---------------------------------------------------------------------------
-def plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_png):
+def make_discrete_popularity_cmap(levels, base_name="viridis"):
+    """Строит ДИСКРЕТНУЮ цветовую шкалу для тепловой карты популяций.
+
+    Вместо плавного градиента (в котором близкие по величине ячейки почти
+    неразличимы) шкала разбивается на `levels` отдельных цветовых полос:
+    каждая полоса покрывает небольшой интервал значений популяции, поэтому
+    «на глаз» видно, к какому уровню относится ячейка.
+
+    Оттенки берутся из последовательной (perceptually uniform) базы viridis —
+    она интуитивно понятна человеку: тёмно-фиолетовый = мало кадров,
+    синий/зелёный = больше, жёлтый = максимум; яркость растёт вместе с
+    популяцией. Соседние оттенки дополнительно разделяются тонкими белыми
+    границами (edgecolor у pcolormesh).
+
+    Возвращает matplotlib ListedColormap с `levels` цветами. Границы уровней
+    (bounds) задаёт вызывающий код — см. plot_histogram.
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    levels = max(2, int(levels))
+    base = plt.get_cmap(base_name, levels)          # N ровных оттенков из базы
+    colors = [base(i) for i in range(levels)]       # каждый — отдельная полоса
+    cmap = matplotlib.colors.ListedColormap(colors, name=f"pop_{base_name}_{levels}")
+    return cmap
+
+
+def plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_png,
+                   heatmap_levels=None):
     """Строит 2D-гистограмму распределения кадров в плоскости (DI, GI),
-    отмечает целевую точку и прямоугольник окна допуска, сохраняет PNG."""
+    отмечает целевую точку и прямоугольник окна допуска, сохраняет PNG.
+
+    Цветовая шкала — дискретная (см. make_discrete_popularity_cmap): много
+    цветов, каждый покрывает небольшой интервал популяции, порядок цветов
+    интуитивен (тёмный = редко, светлый/жёлтый = часто)."""
     try:
         import matplotlib
         matplotlib.use("Agg")           # рендеринг без дисплея
         import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        import numpy as np
     except ImportError:
         print("ПРЕДУПРЕЖДЕНИЕ: matplotlib не установлен, пропускаю построение графика (--plot).")
         return
 
-    fig, ax = plt.subplots(figsize=(7, 6))
-    hb = ax.hist2d(di_all, gi_all, bins=60, cmap="viridis")
-    fig.colorbar(hb[3], ax=ax, label="число кадров")
+    # --- 2D-гистограмма (считаем сами, чтобы раскрасить дискретной шкалой) ---
+    bins = 60
+    H, xe, ye = np.histogram2d(di_all, gi_all, bins=bins)
+    max_pop = int(H.max()) if H.size else 1
+
+    if heatmap_levels is None:
+        # автовыбор: каждый цвет покрывает небольшой интервал популяции.
+        # при max_pop <= 48 — один цвет на каждое значение (1 кадр/цвет);
+        # иначе шаг округляется вверх до «удобного» числа (1,2,5 x 10^n),
+        # а число цветов остаётся большим (десятки различимых оттенков)
+        raw_step = max(1.0, max_pop / 48.0)
+        mag = 10 ** math.floor(math.log10(raw_step))
+        for m in (1, 2, 2.5, 5, 10):
+            nice = m * mag
+            if nice >= raw_step:
+                break
+        step = max(1, int(round(nice)))
+        heatmap_levels = min(48, max(10, int(math.ceil(max_pop / step))))
+        bounds = np.arange(heatmap_levels + 1, dtype=float) * step
+    else:
+        # явное число уровней: границы равномерно от 0 до max_pop
+        heatmap_levels = max(2, int(heatmap_levels))
+        bounds = np.linspace(0, max(max_pop, 1), heatmap_levels + 1)
+
+    cmap = make_discrete_popularity_cmap(heatmap_levels)
+    pop_per_color = float(bounds[1] - bounds[0])
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.5))
+    # pcolormesh рисует каждую ячейку с белой рамкой -> соседние оттенки
+    # различимы даже при малой разнице популяций
+    mesh = ax.pcolormesh(xe, ye, H.T, cmap=cmap, norm=matplotlib.colors.BoundaryNorm(
+        bounds, cmap.N), edgecolors="white", linewidths=0.35, rasterized=True)
+    ax.set_xlim(xe[0], xe[-1])
+    ax.set_ylim(ye[0], ye[-1])
+
+    # Если уровней много, подписи всех границ не влезают — показываем подмножество
+    tick_vals = bounds
+    if cmap.N > 25:
+        step_t = int(math.ceil(cmap.N / 16.0))
+        tick_vals = np.concatenate([bounds[::step_t], [bounds[-1]]])
+    fmt = mticker.FuncFormatter(
+        lambda v, _: f"{v:.10g}".rstrip("0").rstrip("."))
+    cbar = fig.colorbar(mesh, ax=ax, ticks=tick_vals, extend="max", format=fmt)
+    ppc_txt = "1 кадр" if pop_per_color == 1 else f"{pop_per_color:g} кадров"
+    cbar.set_label(f"число кадров (дискретная шкала: {cmap.N} цветов, "
+                   f"каждый цвет = интервал {ppc_txt})")
+    cbar.outline.set_visible(True)
 
     # целевая точка
     ax.plot(DI_target, GI_target, marker="*", ms=18, mfc="red", mec="black",
@@ -482,12 +566,14 @@ def plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_png
 
     ax.set_xlabel("DI (Dimer Index)")
     ax.set_ylabel("GI (Growth Index)")
-    ax.set_title("Распределение кадров траектории по коллективным переменным")
+    ax.set_title("Распределение кадров траектории по коллективным переменным\n"
+                 "(тепловая карта популяций, дискретная цветовая шкала)")
     ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
-    print(f"График сохранён: {out_png}")
+    print(f"График сохранён: {out_png} (дискретных цветов: {cmap.N}, "
+          f"каждый покрывает интервал популяции {pop_per_color:g})")
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +852,10 @@ def parse_args():
                    help="Построить 2D-гистограмму (DI, GI) и сохранить в --out_png.")
     p.add_argument("--out_png", default="DI_GI_hist.png",
                    help="Имя файла графика при использовании --plot.")
+    p.add_argument("--heatmap_levels", type=int, metavar="N", default=None,
+                   help="Число цветов (уровней) дискретной цветовой шкалы тепловой "
+                        "карты: каждый цвет покрывает интервал популяции в 1 кадр. "
+                        "По умолчанию подбирается автоматически (до 48).")
     p.add_argument("--out_timeline_html", metavar="HTML", default=None,
                    help="Интерактивная полоса времени (plotly HTML): серая полоса — "
                         "всё время траектории, яркие интервалы — кадры из selected; "
@@ -809,7 +899,8 @@ def main():
             print("ПРЕДУПРЕЖДЕНИЕ: --DI/--GI не заданы — целевая точка на графике "
                   "поставлена в медиану распределения.")
         plot_histogram(di_all, gi_all, DI_target, GI_target,
-                       args.tol_DI, args.tol_GI, args.out_png)
+                       args.tol_DI, args.tol_GI, args.out_png,
+                       heatmap_levels=args.heatmap_levels)
         return
 
     # --- Режим 1: полный пересчёт по траектории ------------------------------
@@ -952,7 +1043,8 @@ def main():
 
     # --- опциональный график ------------------------------------------------
     if args.plot:
-        plot_histogram(di_all, gi_all, args.DI, args.GI, args.tol_DI, args.tol_GI, args.out_png)
+        plot_histogram(di_all, gi_all, args.DI, args.GI, args.tol_DI, args.tol_GI,
+                       args.out_png, heatmap_levels=args.heatmap_levels)
 
     # --- полоса времени (timeline): серая — вся траектория, яркие — selected --
     if not args.no_timeline:
