@@ -47,12 +47,17 @@ select_frames_by_DI_GI.py
   * XTC-файл с отобранными кадрами (в исходном порядке, все атомы системы);
   * Timeline — полоса времени всей траектории (серая), на которой ярким
     цветом выделены интервалы кадров, попавших в selected (см. ниже);
-  * (опционально) 2D-гистограмма (DI, GI) с целевой точкой и окном допуска;
-    цветовая шкала тепловой карты — РАЗНОЦВЕТНАЯ ДИСКРЕТНАЯ («радуга»):
-    много разных цветов, идущих друг за другом (по умолчанию до ~64 уровня,
-    каждый цвет = небольшой интервал популяции), упорядоченных интуитивно —
-    от холодного фиолетового (мало кадров) через синий/зелёный/жёлтый/оранжевый
-    к красному (максимум); число цветов настраивается --heatmap_levels;
+  * ИНТЕРАКТИВНАЯ тепловая карта (DI, GI) в HTML (строится автоматически после
+    полного расчёта, если не указан --no_heatmap_html): на странице отмечены
+    целевая точка и окно допуска, а цветовую шкалу пользователь настраивает
+    сам в браузере — добавляет цвета с помощью ЦВЕТОВОГО КРУГА (HSV) или
+    системного пикера, двигает ползунки и вводит численные ГРАНИЦЫ диапазонов
+    популяции, переключает дискретные полосы/плавный градиент, включает
+    равномерную легенду с зазубринами в местах резкой смены масштаба,
+    сохраняет/загружает шкалу в .json, применяет пресеты и скачивает PNG
+    (как на экране или вся карта). Стартовая шкала — разноцветная дискретная
+    («радуга», до ~64 уровней; число задаётся --heatmap_levels). Статический
+    PNG-вариант остаётся доступен как запасной (--plot / --static_png);
   * краткий отчёт в stdout.
 
 TIMELINE (полоса времени):
@@ -80,17 +85,27 @@ TIMELINE (полоса времени):
         --DI -0.5 --GI 0.3 \
         --tol_DI 0.2 --tol_GI 0.3 \
         --out_xtc selected.xtc \
-        --out_csv all_frames.csv \
-        --plot --out_png fes_hist.png
+        --out_csv all_frames.csv
+        # автоматически: all_frames_heatmap.html (интерактивная карта),
+        #               all_frames_timeline.html / .png
+        # добавить статический PNG: --static_png --out_png fes_hist.png
 
     # Вместо жёсткого окна — выбрать 10 ближайших кадров к целевой точке:
     python3 select_frames_by_DI_GI.py ... --top_n 10
 
-    # Перестроить только heatmap по уже рассчитанному CSV — БЕЗ пересчёта траектории:
-    python3 select_frames_by_DI_GI.py --from_csv all_frames.csv \
-        --DI 0.7 --GI 11.0 --out_png fes_hist.png
+    # НЕ выходить за окно допуска, но взять из него N ближайших к цели
+    # (если в окне меньше N — берутся все попавшие):
+    python3 select_frames_by_DI_GI.py ... --top_n 100 --within_window
 
-Зависимости: numpy, MDAnalysis (matplotlib — только для опций --plot / --from_csv).
+    # Перестроить только интерактивную карту по уже рассчитанному CSV — БЕЗ
+    # пересчёта траектории (PNG добавится с --static_png):
+    python3 select_frames_by_DI_GI.py --from_csv all_frames.csv \
+        --DI 0.7 --GI 11.0
+
+Зависимости: numpy, MDAnalysis (matplotlib — только для статического PNG
+--plot / --static_png / --from_csv). Интерактивная HTML-карта Plotly.js грузится
+из CDN в браузере, поэтому на стороне Python plotly не обязателен; эта же
+библиотека нужна для интерактивного timeline.
 """
 
 import argparse
@@ -495,6 +510,70 @@ def make_discrete_popularity_cmap(levels, base_name="rainbow"):
     return cmap
 
 
+def compute_histogram2d(di_all, gi_all, bins=60):
+    """Считает 2D-гистограмму распределения кадров в плоскости (DI, GI).
+
+    Возвращает (H, xe, ye, max_pop):
+        H       : (nx, ny) матрица числа кадров, H[ix, iy] = ячейка (DI-бин ix, GI-бин iy);
+        xe, ye  : границы бинов по DI и GI (длина nx+1 и ny+1);
+        max_pop : максимальная популяция среди ячеек (>= 1).
+    """
+    H, xe, ye = np.histogram2d(di_all, gi_all, bins=bins)
+    max_pop = int(H.max()) if H.size else 1
+    return H, xe, ye, max(1, max_pop)
+
+
+def hsv_rainbow_hex(n, h_start=0.75, h_end=0.0, s=0.9, v=0.95):
+    """Возвращает список из `n` HEX-цветов, идущих по радуге от фиолетового к красному.
+
+    Используется как стартовая/предустановленная палитра для интерактивной
+    цветовой шкалы (не требует matplotlib — только stdlib colorsys).
+    """
+    import colorsys
+    n = max(1, int(n))
+    if n == 1:
+        h_vals = [h_start]
+    else:
+        h_vals = [h_start + (h_end - h_start) * (i / (n - 1)) for i in range(n)]
+    out = []
+    for h in h_vals:
+        r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+        out.append("#%02x%02x%02x" % (int(round(r * 255)), int(round(g * 255)), int(round(b * 255))))
+    return out
+
+
+def default_color_bands(max_pop, heatmap_levels=None):
+    """Считает стартовые границы и цвета дискретной шкалы «радуга».
+
+    Логика ровно та же, что и в статической карте (plot_histogram):
+      * heatmap_levels не задан — автоподбор: при небольшой популяции один
+        цвет на каждое значение, иначе шаг округляется до «удобного» числа,
+        а число цветов остаётся большим (до 64);
+      * heatmap_levels задан — ровно столько цветов, границы равномерно
+        от 0 до max_pop.
+
+    Возвращает (bounds, colors):
+        bounds : список длины levels+1 — ГРАНИЦЫ в единицах популяции;
+        colors : список длины levels — HEX-цвет каждого интервала.
+    """
+    max_pop = max(int(max_pop), 1)
+    if heatmap_levels is None:
+        raw_step = max(1.0, max_pop / 64.0)
+        mag = 10 ** math.floor(math.log10(raw_step))
+        for m in (1, 2, 2.5, 5, 10):
+            nice = m * mag
+            if nice >= raw_step:
+                break
+        step = max(1, int(round(nice)))
+        levels = min(64, max(10, int(math.ceil(max_pop / step))))
+        bounds = (np.arange(levels + 1, dtype=float) * step).tolist()
+    else:
+        levels = max(2, int(heatmap_levels))
+        bounds = np.linspace(0.0, float(max_pop), levels + 1).tolist()
+    colors = hsv_rainbow_hex(levels)
+    return bounds, colors
+
+
 def plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_png,
                    heatmap_levels=None):
     """Строит 2D-гистограмму распределения кадров в плоскости (DI, GI),
@@ -585,6 +664,773 @@ def plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_png
 
 
 # ---------------------------------------------------------------------------
+# Интерактивная тепловая карта популяций (HTML + настройка цветовой шкалы)
+# ---------------------------------------------------------------------------
+# Шаблон самодостаточной HTML-страницы: Plotly.js подключается с CDN (как и в
+# timeline), данные гистограммы и стартовая шкала встраиваются как JSON в
+# маркер /*__HEATMAP_PAYLOAD__*/. Панель управления на чистом JS позволяет:
+#   * добавлять цвета через ЦВЕТОВОЙ КРУГ (HSV: угол = тон, радиус = насыщенность)
+#     и через системный <input type="color">;
+#   * двигать ползунки — границы диапазонов популяции;
+#   * вводить численные значения границ каждого цветового интервала;
+#   * переключать дискретные полосы / плавный градиент;
+#   * включать равномерную легенду (одинаковые полосы) с зазубринами в местах
+#     резкой смены числового масштаба (нативная colorbar скрыта, легенда
+#     рисуется фигурами в paper-координатах — LEG);
+#   * сохранять/загружать цветовую шкалу в .json (с нормализацией границ под
+#     максимум текущей карты);
+#   * экспортировать PNG в двух режимах: «как на экране» и «вся карта»;
+#   * применять пресеты и сбрасывать шкалу.
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Интерактивная тепловая карта популяций (DI, GI)</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, "Segoe UI", Arial, sans-serif; background: #fff; color: #222; }
+  #wrap { display: flex; align-items: stretch; gap: 12px; padding: 12px; }
+  #plotbox { flex: 1 1 auto; min-width: 320px; }
+  #plot { width: 100%; height: 780px; }
+  #panel { flex: 0 0 372px; max-width: 372px; border: 1px solid #ddd; border-radius: 10px;
+           padding: 12px; background: #fbfbfb; overflow-y: auto; max-height: 92vh; }
+  #panel h2 { margin: 0 0 8px; font-size: 15px; }
+  #panel .hint { font-size: 12px; color: #666; margin-bottom: 10px; line-height: 1.35; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .toolbar button, .toolbar select, .toolbar label {
+      font-size: 12px; padding: 4px 8px; border: 1px solid #bbb; border-radius: 6px;
+      background: #fff; cursor: pointer; }
+  .toolbar label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .toolbar #dlpng { background: #eef6ff; border-color: #7fb2e5; }
+  #bands { display: block; }
+  .band { display: grid; grid-template-columns: 26px 26px 1fr 22px; gap: 6px;
+          align-items: center; padding: 6px; margin-bottom: 6px; background: #fff;
+          border: 1px solid #e2e2e2; border-radius: 8px; }
+  .swatch { width: 24px; height: 24px; border-radius: 6px; border: 1px solid #888;
+            padding: 0; cursor: pointer; }
+  .native { width: 24px; height: 24px; padding: 0; border: none; background: none; cursor: pointer; }
+  .range { display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .range input { width: 68px; padding: 2px 4px; font-size: 12px; border: 1px solid #ccc;
+                 border-radius: 4px; min-width: 0; }
+  .range .blab { font-family: ui-monospace, monospace; font-size: 12px; color: #444; }
+  .del { border: 1px solid #d9a; color: #a33; background: #fff; border-radius: 6px;
+         cursor: pointer; font-size: 14px; line-height: 1; padding: 3px 5px; }
+  .del:disabled { opacity: .35; cursor: default; }
+  .slider { grid-column: 1 / -1; width: 100%; margin: 2px 0 0; }
+  #wheelpop { position: fixed; z-index: 50; width: 176px; padding: 10px; background: #fff;
+              border: 1px solid #bbb; border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
+  #wheelpop.hidden { display: none; }
+  #wheelpop .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  #wheel { display: block; margin: 0 auto; cursor: crosshair; border-radius: 50%; }
+  #wheelprev { width: 28px; height: 28px; border-radius: 6px; border: 1px solid #888; flex: 0 0 auto; }
+  #wheelhex { width: 84px; font-family: ui-monospace, monospace; font-size: 12px; padding: 3px 5px;
+              border: 1px solid #ccc; border-radius: 4px; }
+  #wheelpop #wheelok { margin-left: auto; font-size: 12px; padding: 4px 10px; border: 1px solid #7fb2e5;
+              background: #eef6ff; border-radius: 6px; cursor: pointer; }
+  #wheelpop .lbl { font-size: 12px; color: #555; }
+  #wheelpop input[type=range] { flex: 1 1 auto; }
+  #scalestatus { flex-basis: 100%; font-size: 12px; color: #2a7d4f; min-height: 15px; }
+  #scalestatus.err { color: #c0392b; }
+  @media (max-width: 900px) { #wrap { flex-direction: column; } #panel { max-width: none; flex-basis: auto; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="plotbox"><div id="plot"></div></div>
+  <div id="panel">
+    <h2>🎨 Настройка цветовой шкалы</h2>
+    <div class="hint">
+      Каждая строка — один цвет и его ДИАПАЗОН популяции (число кадров). Меняйте цвет
+      цветовым кругом или системным пикером, двигайте ползунок или вводите точные числа.
+      Границы диапазонов идут по возрастанию; граничные значения можно править.
+    </div>
+    <div class="toolbar">
+      <button id="addcolor">➕ Добавить цвет</button>
+      <select id="preset" title="Готовые палитры">
+        <option value="rainbow">Пресет: радуга</option>
+        <option value="viridis">Пресет: viridis</option>
+        <option value="magma">Пресет: magma</option>
+        <option value="jet">Пресет: jet</option>
+        <option value="gray">Пресет: серый</option>
+      </select>
+      <label title="Дискретные полосы или плавный градиент">
+        <input type="checkbox" id="discrete" checked> дискретные полосы
+      </label>
+      <label title="Каждый цвет легенды одинаковой ширины, даже если числовые диапазоны сильно различаются (положение шкалы, где масштаб меняется, помечается зазубриной). Только для дискретных полос.">
+        <input type="checkbox" id="equallegend" checked> равномерная шкала в легенде
+      </label>
+      <button id="reset">↺ Сброс</button>
+      <button id="savescale" title="Сохранить цветовую шкалу в .json-файл">💾 Сохранить шкалу</button>
+      <button id="loadscale-btn" title="Загрузить цветовую шкалу из .json-файла">📂 Загрузить шкалу</button>
+      <label title="При загрузке пересчитать границы под максимум этой карты (доли от максимума); иначе — абсолютные значения как есть">
+        <input type="checkbox" id="loadnorm" checked> масштабировать под эту карту
+      </label>
+      <input type="file" id="loadscale" accept=".json,application/json" style="display:none">
+      <button id="dlpng-view" title="Сохранить PNG точно как на экране (с текущим зумом/масштабом)">⬇ PNG (вид)</button>
+      <button id="dlpng-full" title="Сохранить PNG в исходном масштабе — вся карта целиком">⬇ PNG (вся карта)</button>
+      <span id="scalestatus"></span>
+    </div>
+    <div id="bands"></div>
+  </div>
+</div>
+
+<div id="wheelpop" class="hidden">
+  <canvas id="wheel" width="156" height="156"></canvas>
+  <div class="row">
+    <div id="wheelprev"></div>
+    <input type="text" id="wheelhex" spellcheck="false">
+    <button id="wheelok">Готово</button>
+  </div>
+  <div class="row">
+    <span class="lbl">Яркость</span>
+    <input type="range" id="wheelval" min="0" max="1" step="0.01" value="1">
+  </div>
+</div>
+
+<script>
+const DATA = /*__HEATMAP_PAYLOAD__*/;
+
+const gd = document.getElementById('plot');
+const state = {
+  bounds: DATA.bounds.slice(),
+  colors: DATA.colors.slice(),
+  discrete: true,
+  equal: true
+};
+
+function fmt(v) {
+  if (!isFinite(v)) return String(v);
+  if (v === 0) return '0';
+  const a = Math.abs(v);
+  if (a >= 1000 || a < 0.01) return Number(v.toPrecision(4)).toString();
+  return Number(v.toFixed(4)).toString();
+}
+
+/* ---------- цветовые утилиты ---------- */
+function hsvToRgb(h, s, v) {
+  h = ((h % 1) + 1) % 1;
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  let r, g, b;
+  switch (i % 6) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q;
+  }
+  return [r * 255, g * 255, b * 255];
+}
+function rgbToHex(r, g, b) {
+  const f = x => ('0' + Math.round(Math.max(0, Math.min(255, x))).toString(16)).slice(-2);
+  return '#' + f(r) + f(g) + f(b);
+}
+function hexToRgb(h) {
+  h = (h || '#000').replace('#', '');
+  if (h.length === 3) h = h.split('').map(c => c + c).join('');
+  return [parseInt(h.substr(0, 2), 16) || 0, parseInt(h.substr(2, 2), 16) || 0, parseInt(h.substr(4, 2), 16) || 0];
+}
+function hex6(h) { const c = hexToRgb(h); return rgbToHex(c[0], c[1], c[2]); }
+function mixHex(a, b, t) {
+  const A = hexToRgb(a), B = hexToRgb(b);
+  return rgbToHex(A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t);
+}
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d) {
+    if (mx === r) h = ((g - b) / d) % 6;
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h /= 6; if (h < 0) h += 1;
+  }
+  return [h, mx ? d / mx : 0, mx];
+}
+
+/* ---------- цветовая шкала (карта) ---------- */
+// Пропорциональная шкала: переходы цветов стоят пропорционально числовым
+// диапазонам. Ею раскрашивается САМА КАРТА (её цвета не зависят от того,
+// равномерна ли легенда). В дискретном режиме каждый диапазон — сплошной
+// цвет (дублированные стопы дают жёсткие границы).
+function buildProportionalColorscale() {
+  const b = state.bounds, c = state.colors, n = c.length;
+  const zmin = b[0], zmax = b[n], rng = (zmax - zmin) || 1;
+  const cs = [];
+  for (let i = 0; i < n; i++) {
+    const p0 = (b[i] - zmin) / rng, p1 = (b[i + 1] - zmin) / rng;
+    if (state.discrete) {
+      cs.push([p0, c[i]]);
+      cs.push([Math.max(p0, p1 - 1e-9), c[i]]);
+    } else {
+      cs.push([(p0 + p1) / 2, c[i]]);
+    }
+  }
+  cs.sort((u, v) => u[0] - v[0]);
+  if (cs[0][0] > 0) cs.unshift([0, c[0]]);
+  if (cs[cs.length - 1][0] < 1) cs.push([1, c[n - 1]]);
+  return cs;
+}
+// Плавный цвет для градиентной легенды в точке t (0..1 по значению).
+function sampleGradient(t) {
+  const b = state.bounds, c = state.colors, n = c.length;
+  const b0 = b[0], rng = (b[n] - b0) || 1;
+  const centers = [];
+  for (let i = 0; i < n; i++) centers.push(((b[i] + b[i + 1]) / 2 - b0) / rng);
+  if (t <= centers[0]) return c[0];
+  if (t >= centers[n - 1]) return c[n - 1];
+  for (let i = 0; i < n - 1; i++)
+    if (t <= centers[i + 1]) {
+      const f = (t - centers[i]) / ((centers[i + 1] - centers[i]) || 1);
+      return mixHex(c[i], c[i + 1], f);
+    }
+  return c[n - 1];
+}
+
+/* ---------- СВОЯ легенда (равномерные диапазоны + зазубрины разрыва шкалы) ---------- */
+// Геометрия легенды в бумажных координатах (x>1 — правая полоса-маргинеса).
+const LEG = { x0: 1.02, x1: 1.075, y0: 0.06, y1: 0.94, tickx: 1.086 };
+// Диапазоны легенды: {lo, hi, color} снизу вверх.
+function legendBands() {
+  const b = state.bounds, c = state.colors, n = c.length;
+  const y0 = LEG.y0, y1 = LEG.y1, span = y1 - y0;
+  const bands = [];
+  if (state.discrete) {
+    const b0 = b[0], rng = (b[n] - b0) || 1;
+    let acc = y0;
+    for (let i = 0; i < n; i++) {
+      const h = state.equal ? span / n : span * (b[i + 1] - b[i]) / rng;
+      bands.push({ lo: acc, hi: acc + h, color: c[i] });
+      acc += h;
+    }
+    bands[bands.length - 1].hi = y1;
+  } else {
+    const strips = Math.max(32, n * 4);
+    for (let i = 0; i < strips; i++)
+      bands.push({ lo: y0 + span * i / strips, hi: y0 + span * (i + 1) / strips,
+                   color: sampleGradient((i + 0.5) / strips) });
+  }
+  return bands;
+}
+// Y-координаты (бумажные) числовых границ: длина n+1.
+function boundaryYs() {
+  const b = state.bounds, n = state.colors.length;
+  if (!state.discrete) {
+    const b0 = b[0], rng = (b[n] - b0) || 1;
+    return b.map(v => LEG.y0 + (LEG.y1 - LEG.y0) * (v - b0) / rng);
+  }
+  const bands = legendBands();
+  const ys = [bands[0].lo];
+  for (const bd of bands) ys.push(bd.hi);
+  return ys;
+}
+// Границы (индексы), где соседние диапазоны резко различаются по ширине.
+function breakBoundaries() {
+  if (!state.discrete) return [];
+  const b = state.bounds, n = state.colors.length;
+  if (n < 2) return [];
+  const gaps = [];
+  for (let i = 0; i < n; i++) gaps.push(Math.max(b[i + 1] - b[i], 0));
+  const sorted = gaps.slice().sort((x, y) => x - y);
+  const median = sorted[Math.floor(sorted.length / 2)] || 1;
+  const out = [];
+  for (let k = 1; k < n; k++) {
+    const left = gaps[k - 1], right = gaps[k];
+    const ratio = Math.max(left, right) / Math.max(Math.min(left, right), 1e-12);
+    if (ratio >= 4 || Math.max(left, right) >= 5 * median) out.push(k);
+  }
+  return out;
+}
+function legendBandShapes() {
+  const sh = [];
+  for (const bd of legendBands())
+    sh.push({ type: 'rect', xref: 'paper', yref: 'paper', x0: LEG.x0, x1: LEG.x1,
+              y0: bd.lo, y1: bd.hi, line: { width: 0 }, fillcolor: bd.color, layer: 'above' });
+  sh.push({ type: 'rect', xref: 'paper', yref: 'paper', x0: LEG.x0, x1: LEG.x1,
+            y0: LEG.y0, y1: LEG.y1, line: { color: '#888', width: 1 },
+            fillcolor: 'rgba(0,0,0,0)', layer: 'above' });
+  return sh;
+}
+function breakShapes() {
+  const ys = boundaryYs(), w = LEG.x1 - LEG.x0, d = 0.007, sh = [];
+  for (const k of breakBoundaries()) {
+    const y = ys[k];
+    sh.push({ type: 'rect', xref: 'paper', yref: 'paper', x0: LEG.x0, x1: LEG.x1,
+              y0: y - d * 1.5, y1: y + d * 1.5, line: { width: 0 },
+              fillcolor: '#ffffff', layer: 'above' });
+    sh.push({ type: 'path', xref: 'paper', yref: 'paper', layer: 'above',
+              line: { color: '#111', width: 1.5 },
+              path: `M ${LEG.x0},${y + d} L ${LEG.x0 + w * 0.25},${y - d} `
+                  + `L ${LEG.x0 + w * 0.5},${y + d} L ${LEG.x0 + w * 0.75},${y - d} L ${LEG.x1},${y + d}` });
+  }
+  return sh;
+}
+function legendAnnotations() {
+  const b = state.bounds, ys = boundaryYs();
+  const breaks = new Set(breakBoundaries());
+  const ann = [{
+    xref: 'paper', yref: 'paper', x: LEG.x0 - 0.008, y: LEG.y1 + 0.02,
+    text: state.equal && state.discrete ? 'число кадров (популяция; шкала равномерная)'
+                                        : 'число кадров (популяция)',
+    showarrow: false, xanchor: 'left', yanchor: 'bottom', font: { size: 11, color: '#333' }
+  }];
+  for (let k = 0; k < ys.length; k++) {
+    const isBreak = breaks.has(k);
+    ann.push({ xref: 'paper', yref: 'paper', x: LEG.tickx, y: ys[k],
+               text: (isBreak ? '⤢ ' : '') + fmt(b[k]), showarrow: false,
+               xanchor: 'left', yanchor: 'middle',
+               font: { size: 10, color: isBreak ? '#c0392b' : '#333' } });
+  }
+  return ann;
+}
+
+function refresh() {
+  const n = state.colors.length;
+  Plotly.restyle(gd, {
+    colorscale: [buildProportionalColorscale()],
+    zmin: [state.bounds[0]],
+    zmax: [state.bounds[n]],
+    showscale: [false]
+  }, [0]);
+  Plotly.relayout(gd, {
+    shapes: legendBandShapes().concat(breakShapes(), [toleranceShape]),
+    annotations: legendAnnotations()
+  });
+}
+
+/* ---------- панель диапазонов ---------- */
+function syncBounds(skipEl) {
+  document.querySelectorAll('[data-bound]').forEach(el => {
+    if (el === skipEl) return;
+    const k = +el.dataset.bound;
+    const v = state.bounds[k];
+    if (el.tagName === 'INPUT') {
+      if (el.type === 'range') el.value = v;
+      else el.value = fmt(v);
+    } else {
+      el.textContent = fmt(v);
+    }
+  });
+}
+function onBoundEdit(k, val, srcEl) {
+  const b = state.bounds, n = state.colors.length;
+  if (!isFinite(val)) return;
+  const span = (b[n] - b[0]) || 1;
+  const gap = span / 1000;
+  if (k === 0) val = Math.min(val, b[1] - gap);
+  else if (k === n) val = Math.max(val, b[n - 1] + gap);
+  else val = Math.min(Math.max(val, b[k - 1] + gap), b[k + 1] - gap);
+  b[k] = val;
+  syncBounds(srcEl);
+  refresh();
+}
+function renderBands() {
+  const wrap = document.getElementById('bands');
+  wrap.innerHTML = '';
+  const b = state.bounds, c = state.colors, n = c.length;
+  const gmin = Math.min(0, b[0]);
+  const gmax = Math.max(DATA.maxPop, b[n]);
+  for (let i = 0; i < n; i++) {
+    const row = document.createElement('div');
+    row.className = 'band';
+
+    const sw = document.createElement('button');
+    sw.className = 'swatch'; sw.style.background = c[i];
+    sw.title = 'Изменить цвет (цветовой круг)';
+    sw.addEventListener('click', e => openWheel(i, e.currentTarget));
+
+    const nat = document.createElement('input');
+    nat.type = 'color'; nat.className = 'native'; nat.value = hex6(c[i]);
+    nat.title = 'Системный выбор цвета';
+    nat.addEventListener('input', () => {
+      state.colors[i] = nat.value; sw.style.background = nat.value; refresh();
+    });
+
+    const range = document.createElement('div');
+    range.className = 'range';
+    let lo;
+    if (i === 0) {
+      lo = document.createElement('input');
+      lo.type = 'number'; lo.step = 'any'; lo.dataset.bound = '0'; lo.value = fmt(b[0]);
+      lo.addEventListener('input', () => onBoundEdit(0, parseFloat(lo.value), lo));
+    } else {
+      lo = document.createElement('span');
+      lo.className = 'blab'; lo.dataset.bound = String(i); lo.textContent = fmt(b[i]);
+    }
+    const dash = document.createElement('span');
+    dash.className = 'blab'; dash.textContent = '–';
+    const hi = document.createElement('input');
+    hi.type = 'number'; hi.step = 'any'; hi.dataset.bound = String(i + 1); hi.value = fmt(b[i + 1]);
+    hi.addEventListener('input', () => onBoundEdit(i + 1, parseFloat(hi.value), hi));
+    range.append(lo, dash, hi);
+
+    const del = document.createElement('button');
+    del.className = 'del'; del.textContent = '×'; del.title = 'Удалить цветовой диапазон';
+    del.disabled = n <= 1;
+    del.addEventListener('click', () => removeBand(i));
+
+    const sl = document.createElement('input');
+    sl.type = 'range'; sl.className = 'slider'; sl.dataset.bound = String(i + 1);
+    sl.min = gmin; sl.max = gmax; sl.step = ((gmax - gmin) / 500) || 0.1; sl.value = b[i + 1];
+    sl.addEventListener('input', () => onBoundEdit(i + 1, parseFloat(sl.value), sl));
+
+    row.append(sw, nat, range, del, sl);
+    wrap.appendChild(row);
+  }
+}
+function addBand() {
+  const b = state.bounds, c = state.colors, n = c.length;
+  let wi = 0, wmax = -1;
+  for (let i = 0; i < n; i++) { const w = b[i + 1] - b[i]; if (w > wmax) { wmax = w; wi = i; } }
+  const mid = (b[wi] + b[wi + 1]) / 2;
+  b.splice(wi + 1, 0, mid);
+  const nxt = (wi + 1 < n) ? c[wi + 1] : c[wi];
+  c.splice(wi + 1, 0, mixHex(c[wi], nxt, 0.5));
+  renderBands(); refresh();
+}
+function removeBand(i) {
+  const b = state.bounds, c = state.colors, n = c.length;
+  if (n <= 1) return;
+  c.splice(i, 1);
+  if (i < n - 1) b.splice(i + 1, 1); else b.splice(i, 1);
+  renderBands(); refresh();
+}
+
+/* ---------- пресеты ---------- */
+const PRESETS = {
+  viridis: ['#440154', '#482878', '#3e4989', '#31688e', '#26828e', '#1f9e89', '#35b779', '#6ece58', '#b5de2b', '#fde725'],
+  magma: ['#000004', '#180f3d', '#440f76', '#721f81', '#9e2f7f', '#cd4071', '#f1605d', '#fd9668', '#feca8d', '#fcfdbf'],
+  jet: ['#00007f', '#0000ff', '#007fff', '#00ffff', '#7fff7f', '#ffff00', '#ff7f00', '#ff0000', '#7f0000'],
+  gray: ['#f7f7f7', '#bdbdbd', '#737373', '#252525']
+};
+function resample(anchors, n) {
+  if (n === 1) return [anchors[Math.floor(anchors.length / 2)]];
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1) * (anchors.length - 1);
+    const j = Math.floor(t), f = t - j;
+    out.push(mixHex(anchors[j], anchors[Math.min(j + 1, anchors.length - 1)], f));
+  }
+  return out;
+}
+function rainbowColors(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const h = 0.75 * (1 - (n === 1 ? 0 : i / (n - 1)));
+    const c = hsvToRgb(h, 0.9, 0.95);
+    out.push(rgbToHex(c[0], c[1], c[2]));
+  }
+  return out;
+}
+function applyPreset(name) {
+  const n = state.colors.length;
+  state.colors = (name === 'rainbow') ? rainbowColors(n) : resample(PRESETS[name], n);
+  renderBands(); refresh();
+}
+
+/* ---------- цветовой круг ---------- */
+const wc = document.getElementById('wheel');
+const wx = wc.getContext('2d');
+let wheelBand = null, wH = 0.75, wS = 0.9, wV = 0.95;
+function drawWheel() {
+  const size = wc.width, cx = size / 2, cy = size / 2, R = size / 2 - 2;
+  const img = wx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = x - cx, dy = y - cy, r = Math.hypot(dx, dy);
+      const idx = (y * size + x) * 4;
+      if (r > R) { img.data[idx + 3] = 0; continue; }
+      const h = (Math.atan2(dy, dx) / (2 * Math.PI) + 1) % 1;
+      const s = Math.min(r / R, 1);
+      const c = hsvToRgb(h, s, 1);
+      img.data[idx] = c[0]; img.data[idx + 1] = c[1]; img.data[idx + 2] = c[2]; img.data[idx + 3] = 255;
+    }
+  }
+  wx.putImageData(img, 0, 0);
+  const ang = wH * 2 * Math.PI, rr = R * wS;
+  const mx = cx + rr * Math.cos(ang), my = cy + rr * Math.sin(ang);
+  wx.beginPath(); wx.arc(mx, my, 5, 0, 2 * Math.PI);
+  wx.lineWidth = 2; wx.strokeStyle = '#fff'; wx.stroke();
+  wx.beginPath(); wx.arc(mx, my, 5, 0, 2 * Math.PI);
+  wx.lineWidth = 1; wx.strokeStyle = '#000'; wx.stroke();
+}
+function applyWheelColor() {
+  const c = hsvToRgb(wH, wS, wV);
+  const hex = rgbToHex(c[0], c[1], c[2]);
+  document.getElementById('wheelhex').value = hex;
+  document.getElementById('wheelprev').style.background = hex;
+  if (wheelBand !== null) {
+    state.colors[wheelBand] = hex;
+    const row = document.querySelectorAll('#bands .band')[wheelBand];
+    if (row) { row.querySelector('.swatch').style.background = hex; row.querySelector('.native').value = hex; }
+    refresh();
+  }
+}
+function openWheel(i, anchor) {
+  wheelBand = i;
+  const c = hexToRgb(state.colors[i]);
+  const hsv = rgbToHsv(c[0], c[1], c[2]);
+  wH = hsv[0]; wS = hsv[1]; wV = hsv[2] || 0.95;
+  document.getElementById('wheelval').value = wV;
+  document.getElementById('wheelprev').style.background = state.colors[i];
+  document.getElementById('wheelhex').value = hex6(state.colors[i]);
+  drawWheel();
+  const pop = document.getElementById('wheelpop');
+  pop.classList.remove('hidden');
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - 190, r.left - 140)) + 'px';
+  pop.style.top = Math.min(window.innerHeight - 240, r.bottom + 6) + 'px';
+}
+wc.addEventListener('click', e => {
+  const rect = wc.getBoundingClientRect(), size = wc.width, cx = size / 2, cy = size / 2, R = size / 2 - 2;
+  const dx = (e.clientX - rect.left) * (size / rect.width) - cx;
+  const dy = (e.clientY - rect.top) * (size / rect.height) - cy;
+  wH = (Math.atan2(dy, dx) / (2 * Math.PI) + 1) % 1;
+  wS = Math.min(Math.hypot(dx, dy) / R, 1);
+  drawWheel(); applyWheelColor();
+});
+document.getElementById('wheelval').addEventListener('input', e => { wV = +e.target.value; applyWheelColor(); });
+document.getElementById('wheelhex').addEventListener('change', e => {
+  const c = hexToRgb(e.target.value); const hsv = rgbToHsv(c[0], c[1], c[2]);
+  wH = hsv[0]; wS = hsv[1]; wV = hsv[2] || wV;
+  document.getElementById('wheelval').value = wV;
+  drawWheel(); applyWheelColor();
+});
+document.getElementById('wheelok').addEventListener('click', () => {
+  document.getElementById('wheelpop').classList.add('hidden'); wheelBand = null;
+});
+document.addEventListener('mousedown', e => {
+  const pop = document.getElementById('wheelpop');
+  if (!pop.classList.contains('hidden') && !pop.contains(e.target) && !e.target.classList.contains('swatch'))
+    pop.classList.add('hidden');
+});
+
+/* ---------- сохранение/загрузка цветовой шкалы в файл ---------- */
+function setStatus(msg, isErr) {
+  const el = document.getElementById('scalestatus');
+  el.textContent = msg || '';
+  el.className = isErr ? 'err' : '';
+}
+function scaleToObject() {
+  return {
+    type: 'di_gi_colorscale', version: 1, created: new Date().toISOString(),
+    discrete: state.discrete, equal: state.equal, sourceMaxPop: DATA.maxPop,
+    bounds: state.bounds.slice(), colors: state.colors.slice()
+  };
+}
+function applyScaleObject(obj, normalized) {
+  if (!obj || obj.type !== 'di_gi_colorscale' || !Array.isArray(obj.bounds) || !Array.isArray(obj.colors))
+    throw new Error('это не файл цветовой шкалы DI/GI');
+  if (obj.colors.length !== obj.bounds.length - 1 || obj.colors.length < 1)
+    throw new Error('число границ и цветов не согласовано');
+  const srcMax = (+obj.sourceMaxPop > 0) ? +obj.sourceMaxPop : 0;
+  const useNorm = normalized && srcMax > 0;
+  const curMax = Math.max(1, DATA.maxPop);
+  const bounds = obj.bounds.map(v => {
+    v = +v;
+    if (!isFinite(v)) throw new Error('некорректная граница диапазона');
+    return useNorm ? v / srcMax * curMax : v;
+  });
+  for (let i = 1; i < bounds.length; i++)
+    if (bounds[i] <= bounds[i - 1]) throw new Error('границы должны строго возрастать');
+  const colors = obj.colors.map(c => {
+    if (typeof c !== 'string' || !/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(c))
+      throw new Error('некорректный цвет: ' + c);
+    const h = hex6(c);
+    if (!/^#[0-9a-f]{6}$/.test(h)) throw new Error('некорректный цвет: ' + c);
+    return h;
+  });
+  state.bounds = bounds; state.colors = colors;
+  if (typeof obj.discrete === 'boolean') {
+    state.discrete = obj.discrete;
+    document.getElementById('discrete').checked = obj.discrete;
+  }
+  if (typeof obj.equal === 'boolean') {
+    state.equal = obj.equal;
+    document.getElementById('equallegend').checked = obj.equal;
+  }
+  renderBands(); refresh();
+}
+function saveScale() {
+  try {
+    const blob = new Blob([JSON.stringify(scaleToObject(), null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'DI_GI_colorscale.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setStatus('шкала сохранена в файл DI_GI_colorscale.json', false);
+  } catch (e) { setStatus('ошибка сохранения: ' + e.message, true); }
+}
+
+/* ---------- кнопки ---------- */
+document.getElementById('addcolor').addEventListener('click', addBand);
+document.getElementById('reset').addEventListener('click', () => {
+  state.bounds = DATA.bounds.slice(); state.colors = DATA.colors.slice();
+  renderBands(); refresh(); setStatus('');
+});
+document.getElementById('discrete').addEventListener('change', e => { state.discrete = e.target.checked; refresh(); });
+document.getElementById('equallegend').addEventListener('change', e => { state.equal = e.target.checked; refresh(); });
+document.getElementById('preset').addEventListener('change', e => { applyPreset(e.target.value); e.target.selectedIndex = 0; });
+document.getElementById('savescale').addEventListener('click', saveScale);
+document.getElementById('loadscale-btn').addEventListener('click', () => document.getElementById('loadscale').click());
+document.getElementById('loadscale').addEventListener('change', e => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    try {
+      applyScaleObject(JSON.parse(rd.result), document.getElementById('loadnorm').checked);
+      setStatus('шкала загружена из ' + f.name
+        + (document.getElementById('loadnorm').checked ? ' (масштабирована под эту карту)' : ''), false);
+    } catch (err) { setStatus('не удалось загрузить шкалу: ' + err.message, true); }
+    e.target.value = '';
+  };
+  rd.onerror = () => { setStatus('не удалось прочитать файл', true); e.target.value = ''; };
+  rd.readAsText(f);
+});
+// PNG «как на экране»: текущий зум/панорамирование и текущие пропорции.
+document.getElementById('dlpng-view').addEventListener('click', () => {
+  const fl = gd._fullLayout || {};
+  Plotly.downloadImage(gd, { format: 'png', filename: 'DI_GI_heatmap_view',
+    width: fl.width, height: fl.height, scale: 2 });
+});
+// PNG «вся карта»: временно показываем весь диапазон данных и возвращаем вид назад.
+document.getElementById('dlpng-full').addEventListener('click', () => {
+  const fl = gd._fullLayout || {};
+  const prevX = fl.xaxis && fl.xaxis.range ? fl.xaxis.range.slice() : null;
+  const prevY = fl.yaxis && fl.yaxis.range ? fl.yaxis.range.slice() : null;
+  Plotly.relayout(gd, { 'xaxis.range': DATA.xrange, 'yaxis.range': DATA.yrange }).then(() => {
+    return Plotly.downloadImage(gd, { format: 'png', filename: 'DI_GI_heatmap_full', scale: 2 });
+  }).finally(() => {
+    const back = {};
+    if (prevX) back['xaxis.range'] = prevX; else back['xaxis.autorange'] = true;
+    if (prevY) back['yaxis.range'] = prevY; else back['yaxis.autorange'] = true;
+    Plotly.relayout(gd, back);
+  });
+});
+
+/* ---------- инициализация ---------- */
+const nBands = state.colors.length;
+const toleranceShape = {
+  type: 'rect',
+  x0: DATA.target[0] - DATA.tol[0], x1: DATA.target[0] + DATA.tol[0],
+  y0: DATA.target[1] - DATA.tol[1], y1: DATA.target[1] + DATA.tol[1],
+  line: { color: 'red', width: 2, dash: 'dash' },
+  fillcolor: 'rgba(255,0,0,0)', layer: 'above'
+};
+const heatTrace = {
+  type: 'heatmap', z: DATA.z, x: DATA.x, y: DATA.y, customdata: DATA.z,
+  colorscale: buildProportionalColorscale(),
+  zmin: state.bounds[0], zmax: state.bounds[nBands],
+  showscale: false, hoverongaps: false,
+  hovertemplate: 'DI=%{x:.3f}<br>GI=%{y:.3f}<br>кадров: %{customdata}<extra></extra>'
+};
+const targetTrace = {
+  type: 'scatter', mode: 'markers', x: [DATA.target[0]], y: [DATA.target[1]],
+  marker: { symbol: 'star', size: 18, color: 'red', line: { color: 'black', width: 1 } },
+  name: 'цель', hovertemplate: 'цель: DI=%{x:.3f}, GI=%{y:.3f}<extra></extra>'
+};
+Plotly.newPlot(gd, [heatTrace, targetTrace], {
+  title: DATA.title,
+  xaxis: { title: 'DI (Dimer Index)', zeroline: false },
+  yaxis: { title: 'GI (Growth Index)', zeroline: false },
+  shapes: legendBandShapes().concat(breakShapes(), [toleranceShape]),
+  annotations: legendAnnotations(),
+  dragmode: 'zoom',
+  template: 'plotly_white',
+  margin: { l: 60, r: 165, t: 54, b: 50 },
+  height: 780
+}, { responsive: true, displaylogo: false,
+     modeBarButtonsToRemove: ['select2d', 'lasso2d'] });
+
+renderBands();
+drawWheel();
+</script>
+</body>
+</html>
+"""
+
+
+def write_heatmap_html(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI, out_html,
+                       heatmap_levels=None, bins=60, title=None):
+    """Строит ИНТЕРАКТИВНУЮ тепловую карту (DI, GI) и сохраняет её как HTML.
+
+    В отличие от статического PNG (plot_histogram), полученная страница
+    позволяет пользователю прямо в браузере:
+        * добавлять/удалять цвета, выбирая их на ЦВЕТОВОМ КРУГЕ (или системным
+          пикером);
+        * двигать ползунки — границы диапазонов популяции;
+        * вводить численные значения границ каждого цветового интервала;
+        * переключать дискретные полосы / плавный градиент, применять пресеты,
+          сбрасывать шкалу и скачивать PNG;
+        * включать РАВНОМЕРНУЮ ЛЕГЕНДУ (все диапазоны одинаковой высоты) —
+          места, где числовой масштаб резко меняется, помечаются зазубриной;
+        * сохранять/загружать цветовую шкалу в .json-файл (при загрузке можно
+          масштабировать границы под максимум текущей карты);
+        * экспортировать PNG в двух режимах: «как на экране» (текущий зум) и
+          «вся карта» (исходный полный диапазон).
+
+    Данные гистограммы и стартовая шкала встраиваются в HTML как JSON;
+    Plotly.js подгружается с CDN. Возвращает True (файл записан).
+    """
+    import json
+
+    H, xe, ye, max_pop = compute_histogram2d(di_all, gi_all, bins=bins)
+    bounds, colors = default_color_bands(max_pop, heatmap_levels)
+
+    # центры бинов — именно на них Plotly рисует ячейки
+    xc = (0.5 * (xe[:-1] + xe[1:])).tolist()
+    yc = (0.5 * (ye[:-1] + ye[1:])).tolist()
+
+    payload = {
+        "z": H.T.astype(int).tolist(),   # Plotly: z[row=y][col=x]
+        "x": [float(v) for v in xc],
+        "y": [float(v) for v in yc],
+        "bounds": [float(v) for v in bounds],
+        "colors": colors,
+        "target": [float(DI_target), float(GI_target)],
+        "tol": [float(tol_DI), float(tol_GI)],
+        "maxPop": int(max_pop),
+        "xrange": [float(xe[0]), float(xe[-1])],
+        "yrange": [float(ye[0]), float(ye[-1])],
+        "title": title or "Тепловая карта популяций (DI, GI) — настройте цветовую шкалу справа",
+    }
+
+    html = HTML_TEMPLATE.replace("/*__HEATMAP_PAYLOAD__*/", json.dumps(payload, ensure_ascii=False))
+    with open(out_html, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(f"Интерактивная тепловая карта сохранена: {out_html} "
+          f"(цветов: {len(colors)}, диапазонов: {len(bounds) - 1})")
+    return True
+
+
+def emit_heatmap_outputs(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI,
+                         out_html, out_png, heatmap_levels=None, want_png=False):
+    """Записывает интерактивную HTML-карту и/или статический PNG.
+
+    Логика:
+      * если задан out_html — строим интерактивную страницу;
+      * PNG строим, если want_png (--plot/--static_png) ИЛИ HTML построить
+        не удалось (запасной вариант).
+    """
+    html_ok = False
+    if out_html:
+        try:
+            write_heatmap_html(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI,
+                               out_html, heatmap_levels=heatmap_levels)
+            html_ok = True
+        except Exception as e:
+            print(f"ПРЕДУПРЕЖДЕНИЕ: не удалось построить интерактивную HTML-карту "
+                  f"({e}); строю статический PNG.")
+    if want_png or (out_html and not html_ok):
+        plot_histogram(di_all, gi_all, DI_target, GI_target, tol_DI, tol_GI,
+                       out_png, heatmap_levels=heatmap_levels)
+
+
+# ---------------------------------------------------------------------------
 # Timeline: полоса времени всей траектории с выделенными отобранными интервалами
 # ---------------------------------------------------------------------------
 def merge_selected_intervals(sel_pos, frames, times, dt_frames=None):
@@ -659,15 +1505,18 @@ def plot_timeline_static(frames, times, intervals, out_png, title=None):
     # серая полоса — вся траектория
     ax.add_patch(Rectangle((t0, 0.35), t1 - t0, 0.30, facecolor="#b0b0b0",
                            edgecolor="#808080", lw=0.5, zorder=1))
-    # яркие интервалы selected
-    colors = ["#e4572e", "#f3a712", "#00a5cf", "#7ae582", "#ff4d6d"]
-    for k, iv in enumerate(intervals):
-        w = max(iv["t_end"] - iv["t_start"], (t1 - t0) / max(len(frames), 1) * 0.9)
-        ax.add_patch(Rectangle((iv["t_start"], 0.30), w, 0.40,
-                               facecolor=colors[k % len(colors)],
-                               edgecolor="black", lw=0.4, zorder=2))
-        ax.text(iv["t_start"] + w / 2.0, 0.78, f"#{k+1}", ha="center",
-                va="bottom", fontsize=7, color=colors[k % len(colors)], zorder=3)
+    # яркие интервалы selected — одним векторизованным вызовом
+    min_w = (t1 - t0) / max(len(frames), 1) * 0.9
+    bars = [(iv["t_start"], max(iv["t_end"] - iv["t_start"], min_w))
+            for iv in intervals]
+    if bars:
+        ax.broken_barh(bars, (0.30, 0.40), facecolors="#e4572e",
+                       edgecolors="black", linewidth=0.4, zorder=2)
+    # подписи #k — только если интервалов немного (иначе каша из наложений)
+    if len(bars) <= 30:
+        for k, (x0, w) in enumerate(bars):
+            ax.text(x0 + w / 2.0, 0.78, f"#{k+1}", ha="center",
+                    va="bottom", fontsize=7, color="#e4572e", zorder=3)
 
     ax.set_xlim(t0 - 0.02 * (t1 - t0 + 1e-9), t1 + 0.02 * (t1 - t0 + 1e-9))
     ax.set_ylim(0.15, 1.0)
@@ -718,31 +1567,40 @@ def plot_timeline_interactive(frames, times, di_all, gi_all, intervals, out_html
                                   f"кадров: {len(frames)}<extra></extra>")),
         row=1, col=1)
 
-    # --- ряд 1: яркие интервалы selected ------------------------------------
-    colors = ["#e4572e", "#f3a712", "#00a5cf", "#7ae582", "#ff4d6d", "#b892ff"]
+    # --- ряд 1: яркие интервалы selected (ОДИН трейс, None-разделители) -----
+    # Раньше на каждый интервал создавался отдельный трейс + два add_vrect.
+    # При «рваной» выборке (тысячи коротких интервалов) Plotly строил десятки
+    # тысяч объектов и фактически вешал страницу — HTML не успевал записаться.
+    # Теперь полоса — один трейс, а инфо по интервалу подставляется через
+    # customdata/hovertemplate. Попадные кадры ищем через searchsorted
+    # (O(log N) на интервал), а не полным проходом по всем кадрам.
+    ACCENT = "#e4572e"
+    band_x, band_y, band_cd = [], [], []
     for k, iv in enumerate(intervals):
-        idx = np.nonzero((frames >= iv["f_start"]) & (frames <= iv["f_end"]))[0]
-        # реальные (попадные) границы по времени выбранных кадров
-        ts_sel = times[idx]
-        di_sel = di_all[idx] if len(idx) else np.array([np.nan])
-        gi_sel = gi_all[idx] if len(idx) else np.array([np.nan])
+        i0 = int(np.searchsorted(frames, iv["f_start"], side="left"))
+        i1 = int(np.searchsorted(frames, iv["f_end"], side="right"))
+        di_sel = di_all[i0:i1] if i1 > i0 else np.array([np.nan])
+        gi_sel = gi_all[i0:i1] if i1 > i0 else np.array([np.nan])
         dur = iv["t_end"] - iv["t_start"]
+        info = (f"<b>Интервал #{k+1} (selected)</b><br>"
+                f"Время: {iv['t_start']:.1f} – {iv['t_end']:.1f} пс "
+                f"(Δ={dur:.1f} пс)<br>"
+                f"Кадры: {iv['f_start']} – {iv['f_end']} "
+                f"({i1 - i0} попавших)<br>"
+                f"DI: {di_sel.min():.3f} … {di_sel.max():.3f} "
+                f"(средн. {np.nanmean(di_sel):.3f})<br>"
+                f"GI: {gi_sel.min():.3f} … {gi_sel.max():.3f} "
+                f"(средн. {np.nanmean(gi_sel):.3f})")
+        band_x += [iv["t_start"], iv["t_end"], None]
+        band_y += [1, 1, None]
+        band_cd += [info, info, ""]
+    if intervals:
         fig.add_trace(
-            go.Scatter(x=[iv["t_start"], iv["t_end"]], y=[1, 1], mode="lines",
-                       line=dict(color=colors[k % len(colors)], width=22),
-                       name=f"Интервал #{k+1}",
-                       showlegend=False,
-                       hovertemplate=(
-                           f"<b>Интервал #{k+1} (selected)</b><br>"
-                           f"Время: {iv['t_start']:.1f} – {iv['t_end']:.1f} пс "
-                           f"(Δ={dur:.1f} пс)<br>"
-                           f"Кадры: {iv['f_start']} – {iv['f_end']} "
-                           f"({len(ts_sel)} попавших)<br>"
-                           f"DI: {di_sel.min():.3f} … {di_sel.max():.3f} "
-                           f"(средн. {np.nanmean(di_sel):.3f})<br>"
-                           f"GI: {gi_sel.min():.3f} … {gi_sel.max():.3f} "
-                           f"(средн. {np.nanmean(gi_sel):.3f})"
-                           "<extra></extra>")),
+            go.Scatter(x=band_x, y=band_y, mode="lines",
+                       line=dict(color=ACCENT, width=22),
+                       name="Интервалы в цели", showlegend=False,
+                       customdata=band_cd,
+                       hovertemplate="%{customdata}<extra></extra>"),
             row=1, col=1)
 
     # --- ряд 2: DI(t), ряд 3: GI(t) — контекст ------------------------------
@@ -768,12 +1626,27 @@ def plot_timeline_interactive(frames, times, di_all, gi_all, intervals, out_html
         fig.add_hline(y=DI_t, line=dict(color="red", width=1), **hDI)
         fig.add_hline(y=GI_t, line=dict(color="red", width=1), **hGI)
 
-    # подсветка интервалов на рядах DI/GI вертикальными shapes
-    for k, iv in enumerate(intervals):
-        for r in (2, 3):
-            fig.add_vrect(x0=iv["t_start"], x1=iv["t_end"], row=r, col=1,
-                          fillcolor=colors[k % len(colors)], opacity=0.12,
-                          line_width=0)
+    # Подсветка интервалов на рядах DI/GI: по ОДНОМУ трейсу на ряд с
+    # None-разделёнными вертикальными сегментами (вместо 2·N add_vrect).
+    if intervals:
+        di_lo = float(np.nanmin(di_all)); di_hi = float(np.nanmax(di_all))
+        gi_lo = float(np.nanmin(gi_all)); gi_hi = float(np.nanmax(gi_all))
+        vx, vy_di, vy_gi = [], [], []
+        for iv in intervals:
+            for edge in (iv["t_start"], iv["t_end"]):
+                vx += [edge, edge, None]
+                vy_di += [di_lo, di_hi, None]
+                vy_gi += [gi_lo, gi_hi, None]
+        fig.add_trace(
+            go.Scatter(x=vx, y=vy_di, mode="lines",
+                       line=dict(color=ACCENT, width=1), opacity=0.25,
+                       showlegend=False, hoverinfo="skip"),
+            row=2, col=1)
+        fig.add_trace(
+            go.Scatter(x=vx, y=vy_gi, mode="lines",
+                       line=dict(color=ACCENT, width=1), opacity=0.25,
+                       showlegend=False, hoverinfo="skip"),
+            row=3, col=1)
 
     fig.update_xaxes(range=[t0 - 0.02 * span, t1 + 0.02 * span], row=1, col=1)
     fig.update_yaxes(visible=False, range=[0.6, 1.4], row=1, col=1)
@@ -787,8 +1660,10 @@ def plot_timeline_interactive(frames, times, di_all, gi_all, intervals, out_html
                         "ярким — кадры, попавшие в selected (наведите курсор)"),
         margin=dict(l=60, r=20, t=60, b=40),
         hovermode="closest",
+        dragmode="zoom",
     )
-    fig.write_html(out_html, include_plotlyjs="cdn")
+    fig.write_html(out_html, include_plotlyjs="cdn",
+                   config={"modeBarButtonsToRemove": ["select2d", "lasso2d"]})
     print(f"Timeline (интерактивный HTML) сохранён: {out_html}")
     return True
 
@@ -857,13 +1732,25 @@ def parse_args():
     p.add_argument("--out_xtc", help="Выходная траектория с отобранными кадрами.")
     p.add_argument("--out_csv", help="CSV со значениями DI/GI для всех кадров.")
     p.add_argument("--plot", action="store_true",
-                   help="Построить 2D-гистограмму (DI, GI) и сохранить в --out_png.")
+                   help="Дополнительно к интерактивной странице построить статический "
+                        "PNG с 2D-гистограммой (DI, GI) и сохранить в --out_png.")
+    p.add_argument("--static_png", action="store_true",
+                   help="Синоним --plot: дополнительно сохранить статический PNG-график.")
     p.add_argument("--out_png", default="DI_GI_hist.png",
-                   help="Имя файла графика при использовании --plot.")
+                   help="Имя файла статической картинки (--plot / --static_png).")
     p.add_argument("--heatmap_levels", type=int, metavar="N", default=None,
                    help="Число разных цветов радужной шкалы тепловой карты "
-                        "(каждый цвет покрывает свой интервал популяции). "
+                        "(каждый цвет покрывает свой интервал популяции) — стартовое "
+                        "значение для интерактивной страницы. "
                         "По умолчанию подбирается автоматически (до 64).")
+    p.add_argument("--out_heatmap_html", metavar="HTML", default=None,
+                   help="Интерактивная тепловая карта (DI, GI) с настраиваемой в браузере "
+                        "цветовой шкалой (Plotly.js, CDN). По умолчанию: "
+                        "<out_csv без расширения>_heatmap.html (в режиме --from_csv — "
+                        "<from_csv без расширения>_heatmap.html). "
+                        "Пустая строка \"\" — не создавать.")
+    p.add_argument("--no_heatmap_html", action="store_true",
+                   help="Не строить интерактивную тепловую карту HTML.")
     p.add_argument("--out_timeline_html", metavar="HTML", default=None,
                    help="Интерактивная полоса времени (plotly HTML): серая полоса — "
                         "всё время траектории, яркие интервалы — кадры из selected; "
@@ -879,6 +1766,10 @@ def parse_args():
     p.add_argument("--top_n", type=int, default=None,
                    help="Вместо окна допуска выбрать N кадров, ближайших к (DI, GI) "
                         "по евклидову расстоянию.")
+    p.add_argument("--within_window", action="store_true",
+                   help="Только для --top_n N: брать N ближайших к (DI, GI) не "
+                        "глобально, а среди кадров, попавших в окно --tol_* "
+                        "(если в окне меньше N — берутся все).")
     p.add_argument("--progress", type=int, default=1000,
                    help="Частота вывода прогресса (каждые N кадров).")
     return p.parse_args()
@@ -906,9 +1797,18 @@ def main():
         if args.DI is None or args.GI is None:
             print("ПРЕДУПРЕЖДЕНИЕ: --DI/--GI не заданы — целевая точка на графике "
                   "поставлена в медиану распределения.")
-        plot_histogram(di_all, gi_all, DI_target, GI_target,
-                       args.tol_DI, args.tol_GI, args.out_png,
-                       heatmap_levels=args.heatmap_levels)
+        base_csv = os.path.splitext(args.from_csv)[0]
+        if args.out_heatmap_html is not None:
+            html_out = args.out_heatmap_html
+        elif args.no_heatmap_html:
+            html_out = ""
+        else:
+            html_out = base_csv + "_heatmap.html"
+        emit_heatmap_outputs(di_all, gi_all, DI_target, GI_target,
+                             args.tol_DI, args.tol_GI,
+                             out_html=html_out, out_png=args.out_png,
+                             heatmap_levels=args.heatmap_levels,
+                             want_png=(args.plot or args.static_png))
         return
 
     # --- Режим 1: полный пересчёт по траектории ------------------------------
@@ -922,6 +1822,8 @@ def main():
                  "используйте --from_csv)")
     if args.DI is None or args.GI is None:
         sys.exit("ОШИБКА: задайте целевые значения --DI и --GI.")
+    if args.within_window and args.top_n is None:
+        sys.exit("ОШИБКА: --within_window имеет смысл только вместе с --top_n N.")
 
     # --- 1. Загрузка топологии и траектории через MDAnalysis ---------------
     for f in (args.gro, args.xtc, args.ndx_O, args.ndx_C):
@@ -975,7 +1877,24 @@ def main():
     print(f"Таблица всех кадров записана: {args.out_csv}")
 
     # --- 5–6. Отбор кадров ---------------------------------------------------
-    if args.top_n is not None:
+    if args.top_n is not None and args.within_window:
+        # режим: N ближайших к цели СРЕДИ кадров, попавших в окно допуска
+        mask = (np.abs(di_all - args.DI) <= args.tol_DI) & \
+               (np.abs(gi_all - args.GI) <= args.tol_GI)
+        cand = np.nonzero(mask)[0]
+        if len(cand) == 0:
+            sel_pos = cand
+            mode = (f"окно допуска пустое — {args.top_n} ближайших внутри окна "
+                    f"выбрать нельзя")
+        else:
+            dist = np.hypot(di_all[cand] - args.DI, gi_all[cand] - args.GI)
+            k = min(args.top_n, len(cand))
+            sel_pos = np.sort(cand[np.argsort(dist, kind="stable")[:k]])
+            mode = (f"{k} ближайших к цели внутри окна (кандидатов: {len(cand)}): "
+                    f"|DI-{args.DI}|<={args.tol_DI}, |GI-{args.GI}|<={args.tol_GI}")
+            if k < args.top_n:
+                print(f"Примечание: в окне только {k} кадров (< {args.top_n}) — берём все.")
+    elif args.top_n is not None:
         # режим: N ближайших кадров по евклидову расстоянию в плоскости (DI, GI)
         dist = np.hypot(di_all - args.DI, gi_all - args.GI)
         n_sel = min(args.top_n, len(frames))
@@ -1006,8 +1925,9 @@ def main():
         print(f"  Самый близкий кадр: frame={frames[nearest_pos]}, "
               f"time={times[nearest_pos]:.1f} ps, DI={di_all[nearest_pos]:.4f}, "
               f"GI={gi_all[nearest_pos]:.4f}.")
-        print("  Совет: увеличьте --tol_DI/--tol_GI или задайте --top_n 1, "
-              "чтобы явно сохранить ближайший кадр.")
+        print("  Совет: увеличьте --tol_DI/--tol_GI, задайте --top_n 1 "
+              "(глобально ближайший кадр) или --top_n N --within_window "
+              "(N ближайших среди попавших в окно).")
         # выходной xtc при пустом окне не создаём — иначе это битый файл
         print(f"  Файл {args.out_xtc} НЕ создан (нет отобранных кадров).")
     else:
@@ -1049,15 +1969,22 @@ def main():
         except Exception as e:
             print(f"ПРЕДУПРЕЖДЕНИЕ: не удалось записать {gro_out}: {e}")
 
-    # --- опциональный график ------------------------------------------------
-    if args.plot:
-        plot_histogram(di_all, gi_all, args.DI, args.GI, args.tol_DI, args.tol_GI,
-                       args.out_png, heatmap_levels=args.heatmap_levels)
+    # --- тепловая карта: интерактивный HTML (и опционально статический PNG) --
+    base_csv, _ = os.path.splitext(args.out_csv)
+    if args.out_heatmap_html is not None:
+        heat_html = args.out_heatmap_html
+    elif args.no_heatmap_html:
+        heat_html = ""
+    else:
+        heat_html = base_csv + "_heatmap.html"
+    emit_heatmap_outputs(di_all, gi_all, args.DI, args.GI, args.tol_DI, args.tol_GI,
+                         out_html=heat_html, out_png=args.out_png,
+                         heatmap_levels=args.heatmap_levels,
+                         want_png=(args.plot or args.static_png))
 
     # --- полоса времени (timeline): серая — вся траектория, яркие — selected --
     if not args.no_timeline:
         intervals = merge_selected_intervals(sel_pos, frames, times)
-        base_csv, _ = os.path.splitext(args.out_csv)
         html_out = args.out_timeline_html if args.out_timeline_html is not None \
             else base_csv + "_timeline.html"
         png_out = args.out_timeline_png if args.out_timeline_png is not None \
